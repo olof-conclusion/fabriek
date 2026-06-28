@@ -1,0 +1,93 @@
+name: deploy
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  TF_BACKEND_RG: "rg-kvk-viewer-tfstate"
+  TF_BACKEND_SA: "stkvkviewertf"
+  TF_BACKEND_CONTAINER: "tfstate"
+  TF_STATE_KEY: "kvk-viewer.tfstate"
+  ACR_NAME: "acrkvkviewer"
+  IMAGE: "kvk-viewer"
+  # OIDC + Azure AD auth for both the backend (tfstate blob, accessed via the
+  # identity's Storage Blob Data Contributor role) and the provider. Available
+  # to every step so `terraform init` can reach the state account.
+  ARM_USE_OIDC: "true"
+  ARM_USE_AZUREAD: "true"
+  ARM_CLIENT_ID: "${{ vars.AZURE_CLIENT_ID }}"
+  ARM_TENANT_ID: "${{ vars.AZURE_TENANT_ID }}"
+  ARM_SUBSCRIPTION_ID: "${{ vars.AZURE_SUBSCRIPTION_ID }}"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.5"
+
+      - name: Terraform init
+        working-directory: infra
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=$TF_BACKEND_RG" \
+            -backend-config="storage_account_name=$TF_BACKEND_SA" \
+            -backend-config="container_name=$TF_BACKEND_CONTAINER" \
+            -backend-config="key=$TF_STATE_KEY"
+
+      - name: Terraform plan
+        working-directory: infra
+        run: terraform plan -input=false -var "image_tag=${{ github.sha }}"
+
+      # apply runs first so the ACR (and the rest of the landing zone) exists
+      # before we push the image. Cold start: the web app is created pointing at
+      # an image tag that doesn't exist yet; the restart step below pulls it once
+      # it's pushed.
+      - name: Terraform apply
+        if: github.ref == 'refs/heads/main'
+        working-directory: infra
+        run: terraform apply -auto-approve -input=false -var "image_tag=${{ github.sha }}"
+
+      # Build + push the app image. Skips gracefully when the repo has no app
+      # code yet (Dockerfile absent = app codegen / F.5 still pending): the infra
+      # is already provisioned by apply above. The ACR target comes from the
+      # terraform output (the module's real registry), not a guessed name.
+      - name: Build + push image
+        if: github.ref == 'refs/heads/main'
+        run: |
+          if [ ! -f Dockerfile ]; then
+            echo "::warning::No Dockerfile in the repo yet (app codegen pending). Infra is provisioned; skipping image build."
+            exit 0
+          fi
+          ACR=$(terraform -chdir=infra output -raw acr_login_server)
+          az acr login --name "${ACR%%.*}"
+          docker build -t "$ACR/$IMAGE:${{ github.sha }}" .
+          docker push "$ACR/$IMAGE:${{ github.sha }}"
+
+      # Best-effort: each push tags the image with the commit SHA, so terraform
+      # apply above changes linuxFxVersion and App Service auto-pulls. The restart
+      # only matters when re-deploying an unchanged SHA, and `az webapp restart`
+      # is flaky for linux-container apps, so a failure here is non-fatal.
+      - name: Restart web app to pull the new image
+        if: github.ref == 'refs/heads/main'
+        working-directory: infra
+        run: |
+          WEBAPP=$(terraform output -raw app_service_name)
+          az webapp restart --name "$WEBAPP" --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            || echo "::warning::webapp restart failed; app auto-pulls on image-tag change (every commit), so this is non-fatal"
