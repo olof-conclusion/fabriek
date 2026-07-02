@@ -143,7 +143,7 @@ export default function App() {
       <section className="hero">
         <div className="hero-content">
           <p className="eyebrow">RDW Open Data</p>
-          <h1>Nederlands kenteken opzoeken</h1>
+          <h1 className="hero-title-orange">Nederlands kenteken opzoeken</h1>
           <p className="intro">Voer een Nederlands kenteken in. Data afkomstig van RDW Open Data wordt bij de zoekopdracht opgehaald en overzichtelijk getoond.</p>
         </div>
       </section>
